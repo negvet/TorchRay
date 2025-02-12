@@ -75,9 +75,9 @@ class PointingGame:
         # the acceptance region collides with the class mask.
         v, u = torch.meshgrid((
             (torch.arange(mask.shape[0],
-                          dtype=torch.float32) - point[1])**2,
+                          dtype=torch.float32).cuda() - point[1])**2,
             (torch.arange(mask.shape[1],
-                          dtype=torch.float32) - point[0])**2,
+                          dtype=torch.float32).cuda() - point[0])**2,
         ))
         accept = (v + u) < self.tolerance**2
 
@@ -218,4 +218,4 @@ class PointingGameBenchmark(PointingGame):
             mask = ads.coco_as_mask(self.dataset, label, class_id)
 
         assert mask is not None
-        return super(PointingGameBenchmark, self).evaluate(mask, point)
+        return super(PointingGameBenchmark, self).evaluate(mask.cuda(), point)

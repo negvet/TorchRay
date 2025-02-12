@@ -60,7 +60,10 @@ __all__ = [
     "DUAL_VARIANT",
 ]
 
+import time
 import math
+from functools import partial
+
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -562,130 +565,1685 @@ def extremal_perturbation(model,
     shape = perturbation.pyramid.shape[2:]
     mask_generator = MaskGenerator(shape, step, sigma).to(device)
     h, w = mask_generator.shape_in
-    pmask = torch.ones(len(areas), 1, h, w).to(device)
-    if debug:
-        print(f"- mask resolution:\n  {pmask.shape}")
 
-    # Prepare reference area vector.
-    max_area = np.prod(mask_generator.shape_out)
-    reference = torch.ones(len(areas), max_area).to(device)
-    for i, a in enumerate(areas):
-        reference[i, :int(max_area * (1 - a))] = 0
+    use_gauss_mask = 0
+    use_smbo = 0
+    single_gauss = 0
+    reuse_ep_mask_generation = 0
+    mix_of_gauss = 1
 
-    # Initialize optimizer.
-    optimizer = optim.SGD([pmask],
-                          lr=learning_rate,
-                          momentum=momentum,
-                          dampening=momentum)
-    hist = torch.zeros((len(areas), 2, 0))
+    if not use_gauss_mask:
+        pmask = torch.ones(len(areas), 1, h, w).to(device)
+        if debug:
+            print(f"- mask resolution:\n  {pmask.shape}")
 
-    for t in range(max_iter):
-        pmask.requires_grad_(True)
+        # Prepare reference area vector.
+        max_area = np.prod(mask_generator.shape_out)
+        reference = torch.ones(len(areas), max_area).to(device)
+        for i, a in enumerate(areas):
+            reference[i, :int(max_area * (1 - a))] = 0
 
-        # Generate the mask.
-        mask_, mask = mask_generator.generate(pmask)
+        # Initialize optimizer.
+        optimizer = optim.SGD([pmask],
+                              lr=learning_rate,
+                              momentum=momentum,
+                              dampening=momentum)
+        hist = torch.zeros((len(areas), 2, 0))
 
-        # Apply the mask.
-        if variant == DELETE_VARIANT:
-            x = perturbation.apply(1 - mask_)
-        elif variant == PRESERVE_VARIANT:
-            x = perturbation.apply(mask_)
-        elif variant == DUAL_VARIANT:
-            x = torch.cat((
-                perturbation.apply(mask_),
-                perturbation.apply(1 - mask_),
-            ), dim=0)
-        else:
-            assert False
+        for t in range(max_iter):
+            pmask.requires_grad_(True)
 
-        # Apply jitter to the masked data.
-        if jitter and t % 2 == 0:
-            x = torch.flip(x, dims=(3,))
+            # print(pmask.min().data, pmask.max().data, pmask.mean().data)
 
-        # Evaluate the model on the masked data.
-        y = model(x)
+            # Generate the mask.
+            mask_, mask = mask_generator.generate(pmask)
 
-        # Get reward.
-        reward = reward_func(y, target, variant=variant)
+            # Apply the mask.
+            if variant == DELETE_VARIANT:
+                x = perturbation.apply(1 - mask_)
+            elif variant == PRESERVE_VARIANT:
+                x = perturbation.apply(mask_)
+            elif variant == DUAL_VARIANT:
+                x = torch.cat((
+                    perturbation.apply(mask_),
+                    perturbation.apply(1 - mask_),
+                ), dim=0)
+            else:
+                assert False
 
-        # Reshape reward and average over spatial dimensions.
-        reward = reward.reshape(len(areas), -1).mean(dim=1)
+            # Apply jitter to the masked data.
+            if jitter and t % 2 == 0:
+                x = torch.flip(x, dims=(3,))
 
-        # Area regularization.
-        mask_sorted = mask.reshape(len(areas), -1).sort(dim=1)[0]
-        regul = - ((mask_sorted - reference)**2).mean(dim=1) * regul_weight
-        energy = (reward + regul).sum()
 
-        # Gradient step.
-        optimizer.zero_grad()
-        (- energy).backward()
-        optimizer.step()
 
-        pmask.data = pmask.data.clamp(0, 1)
 
-        # Record energy.
-        hist = torch.cat(
-            (hist,
-             torch.cat((
-                 reward.detach().cpu().view(-1, 1, 1),
-                 regul.detach().cpu().view(-1, 1, 1)
-             ), dim=1)), dim=2)
+            # Evaluate the model on the masked data.
+            # with torch.no_grad():
+            y = model(x)
 
-        # Adjust the regulariser/area constraint weight.
-        regul_weight *= 1.0035
 
-        # Diagnostics.
-        debug_this_iter = debug and (t in (0, max_iter - 1)
-                                     or regul_weight / regul_weight_last >= 2)
 
-        if (print_iter is not None and t % print_iter == 0) or debug_this_iter:
-            print("[{:04d}/{:04d}]".format(t + 1, max_iter), end="")
-            for i, area in enumerate(areas):
-                print(" [area:{:.2f} loss:{:.2f} reg:{:.2f}]".format(
-                    area,
-                    hist[i, 0, -1],
-                    hist[i, 1, -1]), end="")
-            print()
 
-        if debug_this_iter:
-            regul_weight_last = regul_weight
+            # Get reward.
+            reward = reward_func(y, target, variant=variant)
+
+            # Reshape reward and average over spatial dimensions.
+            reward = reward.reshape(len(areas), -1).mean(dim=1)
+
+            # Area regularization.
+            mask_sorted = mask.reshape(len(areas), -1).sort(dim=1)[0]
+            regul = - ((mask_sorted - reference)**2).mean(dim=1) * regul_weight
+            energy = (reward + regul).sum()
+
+            # Gradient step.
+            optimizer.zero_grad()
+            (- energy).backward()
+            optimizer.step()
+
+            pmask.data = pmask.data.clamp(0, 1)
+
+            # Record energy.
+            hist = torch.cat(
+                (hist,
+                 torch.cat((
+                     reward.detach().cpu().view(-1, 1, 1),
+                     regul.detach().cpu().view(-1, 1, 1)
+                 ), dim=1)), dim=2)
+
+            # Adjust the regulariser/area constraint weight.
+            regul_weight *= 1.0035
+
+            # Diagnostics.
+            debug_this_iter = debug and (t in (0, max_iter - 1)
+                                         or regul_weight / regul_weight_last >= 2)
+
+            if (print_iter is not None and t % print_iter == 0) or debug_this_iter:
+                print("[{:04d}/{:04d}]".format(t + 1, max_iter), end="")
+                for i, area in enumerate(areas):
+                    print(" [area:{:.2f} loss:{:.2f} reg:{:.2f}]".format(
+                        area,
+                        hist[i, 0, -1],
+                        hist[i, 1, -1]), end="")
+                print()
+
+            if debug_this_iter:
+                regul_weight_last = regul_weight
+                for i, a in enumerate(areas):
+                    plt.figure(i, figsize=(20, 6))
+                    plt.clf()
+                    ncols = 4 if variant == DUAL_VARIANT else 3
+                    plt.subplot(1, ncols, 1)
+                    plt.plot(hist[i, 0].numpy())
+                    plt.plot(hist[i, 1].numpy())
+                    plt.plot(hist[i].sum(dim=0).numpy())
+                    plt.legend(('energy', 'regul', 'both'))
+                    plt.title(f'target area:{a:.2f}')
+                    plt.subplot(1, ncols, 2)
+                    imsc(mask[i], lim=[0, 1])
+                    plt.title(
+                        f"min:{mask[i].min().item():.2f}"
+                        f" max:{mask[i].max().item():.2f}"
+                        f" area:{mask[i].sum() / mask[i].numel():.2f}")
+                    plt.subplot(1, ncols, 3)
+                    imsc(x[i])
+                    if variant == DUAL_VARIANT:
+                        plt.subplot(1, ncols, 4)
+                        imsc(x[i + len(areas)])
+                    plt.pause(0.001)
+
+        mask_ = mask_.detach()
+
+        mask_of_input_shape = mask_
+
+        # Resize saliency map.
+        mask_ = resize_saliency(input,
+                                mask_,
+                                resize,
+                                mode=resize_mode)
+
+        # Smooth saliency map.
+        if smooth > 0:
+            mask_ = imsmooth(
+                mask_,
+                sigma=smooth * min(mask_.shape[2:]),
+                padding_mode='constant'
+            )
+            mask_of_input_shape = imsmooth(
+                mask_of_input_shape,
+                sigma=smooth * min(mask_of_input_shape.shape[2:]),
+                padding_mode='constant'
+            )
+
+        return mask_, hist, mask_of_input_shape
+    else:
+        if use_smbo and single_gauss:
+            from skopt import gp_minimize
+            from skopt import forest_minimize
+            from skopt.space import Real
+            from skopt.plots import plot_convergence
+
+            areas = [0.2]
+
+            def generate_plot_mask(gauss_params, debug=False):
+                pmask = GaussPMask(h, w, areas).generate_pmask(gauss_params)
+                pmask = np.clip(pmask, 0, 1)
+                pmask = torch.tensor(pmask, dtype=torch.float32).to(device)
+                mask_, mask = mask_generator.generate(pmask)
+                # Apply the mask.
+                if variant == DELETE_VARIANT:
+                    x = perturbation.apply(1 - mask_)
+                elif variant == PRESERVE_VARIANT:
+                    x = perturbation.apply(mask_)
+                elif variant == DUAL_VARIANT:
+                    x = torch.cat((
+                        perturbation.apply(mask_),
+                        perturbation.apply(1 - mask_),
+                    ), dim=0)
+                else:
+                    assert False
+
+                # Evaluate the model on the masked data.
+                y = model(x)
+                y = F.softmax(y, dim=1)
+                target_class_prediction_score = y[:, target, :, :]
+                print('target class prediction', target_class_prediction_score)
+
+                if debug:
+                    for i, a in enumerate(areas):
+                        plt.figure(i, figsize=(20, 12))
+                        plt.clf()
+                        ncols = 2
+                        plt.subplot(1, ncols, 1)
+                        imsc(mask[i], lim=[0, 1])
+                        plt.title(
+                            f"min:{mask[i].min().item():.2f}"
+                            f" max:{mask[i].max().item():.2f}"
+                            f" area:{mask[i].sum() / mask[i].numel():.2f}")
+                        plt.subplot(1, ncols, 2)
+                        imsc(x[i])
+                        plt.pause(0.001)
+
+                return mask_, mask, target_class_prediction_score
+            class GaussPMask():
+                def __init__(self, H, W, areas):
+                    self.num_masks = len(areas)
+                    self.H = H
+                    self.W = W
+
+                    h = np.linspace(0, 1, self.H)
+                    w = np.linspace(0, 1, self.W)
+                    self.h, self.w = np.meshgrid(w, h)
+
+                    # self.mh = (torch.tensor([0.5] * self.num_masks))
+                    # self.mw = (torch.tensor([0.5] * self.num_masks))
+
+                    # # sigma_scale = 0.02 # 0.05 optimal for area regul
+                    # self.sh = np.array([0.9] * self.num_masks)  # sigma_scale * H
+                    # self.sw = np.array([0.9] * self.num_masks)  # !!!!!
+
+                    # self.gauss_scale = (torch.tensor([9.] * self.num_masks))
+
+                def _gaussian_2d(self, i):
+                    # # https://stackoverflow.com/questions/11615664/multivariate-normal-density-in-python
+                    # # https://peterroelants.github.io/posts/multivariate-normal-primer/
+                    # covariance = torch.tensor([
+                    #     [self.sh[i], 0],
+                    #     [0, self.sw[i]]
+                    # ])
+                    # A = 1. / (torch.sqrt((2 * math.pi) ** 2 * torch.det(covariance)))
+                    # B = (-1/2) * ((x-mu).T.dot(torch.inverse(cov))).dot((x-mu))
+                    A = 1 / (2 * math.pi * self.sh[i] * self.sw[i])
+                    B = (self.h - self.mh[i]) ** 2 / (2 * self.sh[i] ** 2)
+                    C = (self.w - self.mw[i]) ** 2 / (2 * self.sw[i] ** 2)
+                    return A * np.exp(-(B + C))
+
+                def generate_pmask(self, gauss_params, g_scale=1.2):
+                    # mh, mw = gauss_params
+                    # self.mh = np.array([mh] * self.num_masks)
+                    # self.mw = np.array([mw] * self.num_masks)
+
+                    # sh, sw = gauss_params
+                    # self.sh = np.array([sh] * self.num_masks)
+                    # self.sw = np.array([sw] * self.num_masks)
+                    # self.mh = np.array([0.5] * self.num_masks)
+                    # self.mw = np.array([0.5] * self.num_masks)
+
+                    mh, mw, sh, sw = gauss_params
+                    self.mh = np.array([mh] * self.num_masks)
+                    self.mw = np.array([mw] * self.num_masks)
+                    self.sh = np.array([sh] * self.num_masks)
+                    self.sw = np.array([sw] * self.num_masks)
+
+                    pmask = np.zeros([len(areas), self.H, self.W])
+                    for i in range(self.num_masks):
+                        z = self._gaussian_2d(i)
+                        pmask[i] = (z / z.max()) * g_scale
+                        # pmask[i] = z * self.gauss_scale[i]
+                        # pmask[i] = z
+                        # z_ = pmask[i].detach().cpu().numpy()
+                    pmask = np.expand_dims(pmask, 1)
+                    return pmask
+
+            t = 0
+            sigma_upper_bound = 0.5
+            regul_area_weight = 300
+
+
+            # reference_covariance_det_vals = np.linspace(sigma_upper_bound**2, reference_covariance_det_target, num_score_area_iter)
+            reference_covariance_det_vals = np.array([0.25, 0.16, 0.08, 0.04, 0.02, 0.01, 0.005, 0.0025, 0.001]) # , 0.005, 0.0025, 0.001
+            num_score_area_iter = len(reference_covariance_det_vals)
+
+            smbo_time_hist = []
+            smbo_time = time.time()
+
+            def ep_func(gauss_params, area_penalty=True, optimize_sigma=True):
+                nonlocal t
+                nonlocal regul_area_weight
+                nonlocal smbo_time
+                # print('\ngauss_params', gauss_params)
+                # print(t)
+
+                t = time.time() - smbo_time
+                print('smbo_time', t)
+                smbo_time_hist.append(t)
+                smbo_time = time.time()
+
+                if not area_penalty and not optimize_sigma:
+                    mh, mw = gauss_params
+                    # use init large sigmas (not optimized)
+                    gauss_params = mh, mw, sigma_upper_bound, sigma_upper_bound
+                pmask = GaussPMask(h, w, areas).generate_pmask(gauss_params)
+                pmask = np.clip(pmask, 0, 1)
+
+                pmask = torch.tensor(pmask, dtype=torch.float32).to(device)
+
+                # print('pmask stats:', pmask.min(), pmask.max(), pmask.mean())
+
+                # Generate the mask.
+                mask_, mask = mask_generator.generate(pmask)
+
+                # Apply the mask.
+                if variant == DELETE_VARIANT:
+                    x = perturbation.apply(1 - mask_)
+                elif variant == PRESERVE_VARIANT:
+                    x = perturbation.apply(mask_)
+                elif variant == DUAL_VARIANT:
+                    x = torch.cat((
+                        perturbation.apply(mask_),
+                        perturbation.apply(1 - mask_),
+                    ), dim=0)
+                else:
+                    assert False
+
+                # # Apply jitter to the masked data.
+                # if jitter and t % 2 == 0:
+                #     x = torch.flip(x, dims=(3,))
+
+                # Evaluate the model on the masked data.
+                # with torch.no_grad():
+                y = model(x)
+                # TODO: will softmax work better?
+                # y = F.softmax(y, dim=1)
+
+                # Get reward.
+                reward = reward_func(y, target, variant=variant)
+                # Reshape reward and average over spatial dimensions.
+                reward = reward.reshape(len(areas), -1).mean(dim=1) #* reward_weight
+                # print('reward_weight', reward_weight)
+                # reward_weight = 0.98 * reward_weight
+
+                # Area regularization.
+                if area_penalty:
+                    # mask_sorted = mask.reshape(len(areas), -1).sort(dim=1)[0]
+                    # regul_area = - ((mask_sorted - reference) ** 2).mean(dim=1) * regul_weight
+                    # sh, sw = gauss_params
+                    _, _, sh, sw = gauss_params
+                    covariance_det = sh * sw
+                    regul_area = - ((covariance_det - reference_covariance_det) ** 2) * regul_area_weight
+                    # print('reference_covariance_det', reference_covariance_det)
+                    # print('regul_area_weight', regul_area_weight)
+                    # regul_area_weight *= 1.2
+                    # if t in [25, 50, 75]:
+                    #     regul_area_weight *= 5
+                    # # Warm up. Give time for localization
+                    # if t < 10:
+                    #     regul_area = regul_area * 0.0001
+                else:
+                    regul_area = 0
+
+                # regul_gauss = - ((gauss_pmask_generator.sh - gauss_pmask_generator.sw) ** 2) * 1000
+                # print('reward Energy', reward.detach().data.cpu().numpy())
+                # print('regul_area Energy', regul_area)
+                energy = (reward + regul_area).sum() #  + regul_area
+                # energy = (regul_area)  # + regul_area
+
+                score = - energy
+                t += 1
+
+                return score.item()
+                # return score
+
+
+            y = model(input)
+            y = F.softmax(y, dim=1)
+            print('[Non perturbed image] target class prediction', y[:, target, :, :])
+            mask_hist = []
+
+
+            # Optimize score w/o area penalty
+            bounds = [Real(low=0.0, high=1.0), Real(low=0.0, high=1.0)]  # means
+            res = gp_minimize(partial(ep_func, area_penalty=False, optimize_sigma=False), bounds, acq_func="PI", n_calls=12, n_initial_points=5, random_state=1234, noise=1e-10)
+            if debug:
+                print('res.x', res.x)
+                print('res.fun', res.fun)
+                # plot_convergence(res)
+                # plt.show()
+            mask_, mask, target_class_prediction_score = generate_plot_mask([res.x[0], res.x[1], sigma_upper_bound, sigma_upper_bound], debug)
+            mask_hist.append((mask_, target_class_prediction_score))
+
+            # Optimize score + area
+            for i in range(num_score_area_iter - 1):
+                print('\niter', i)
+                t = 0
+                reference_covariance_det = reference_covariance_det_vals[i + 1]
+                sigma = math.sqrt(reference_covariance_det)
+                # if i == 0:
+                #     x0_sigma_h = x0_sigma_w = sigma_upper_bound
+                # else:
+                #     ratio = res.x[2]/res.x[3]
+                #     x0_sigma_h = math.sqrt(reference_covariance_det * ratio)
+                #     x0_sigma_w = x0_sigma_h / ratio
+                #     # x0_sigma_h = res.x[2]
+                #     # x0_sigma_w = res.x[3]
+                mean_range = sigma
+                sigma_range = sigma/5
+                bounds = [
+                          Real(low=max(0, res.x[0] - mean_range), high=min(1, res.x[0] + mean_range)),
+                          Real(low=max(0, res.x[1] - mean_range), high=min(1, res.x[1] + mean_range)),
+                          Real(low=sigma - sigma_range, high=sigma + sigma_range),
+                          Real(low=sigma - sigma_range, high=sigma + sigma_range),
+                          # Real(low=max(0, res.x[0] - x0_sigma_h/2), high=min(1, res.x[0] + x0_sigma_h/2)),
+                          # Real(low=max(0, res.x[1] - x0_sigma_w/2), high=min(1, res.x[1] + x0_sigma_w/2)),
+                          # Real(low=x0_sigma_h - sigma_range, high=x0_sigma_h + sigma_range),
+                          # Real(low=x0_sigma_w - sigma_range, high=x0_sigma_w + sigma_range)
+                          ]
+                # print('bounds', bounds)
+                x0 = [res.x[0], res.x[1], sigma, sigma]
+                # x0 = [res.x[0], res.x[1], x0_sigma_h, x0_sigma_w]
+                # x0 = [res.x[0], res.x[1]]
+                # x0 = None
+                res = gp_minimize(partial(ep_func, area_penalty=False), bounds, x0=x0, acq_func="PI", n_calls=12, n_initial_points=5, random_state=1234, noise=1e-10)
+                if debug:
+                    print('res.x', res.x)
+                    print('res.fun', res.fun)
+                    # plot_convergence(res)
+                    # plt.show()
+                mask_, mask, target_class_prediction_score = generate_plot_mask(res.x, debug)
+
+                # if target_class_prediction_score < 0.2:
+                #     print('target_class_prediction_score go below 0.2 -> Break!')
+                #     break
+
+                # TODO: which g_scale to use?
+                pmask = GaussPMask(h, w, areas).generate_pmask(res.x, g_scale=1.2)
+                pmask = torch.tensor(pmask, dtype=torch.float32).to(device)
+                mask_, mask = mask_generator.generate(pmask)
+                mask_hist.append((mask_, target_class_prediction_score))
+                # mask_, mask, target_class_prediction_score = generate_plot_mask([res.x[0], res.x[1], sigma, sigma])
+
+            mask_hist = [mask for (mask, score) in mask_hist if score > 0.1]
+
+            # Combine 3 last masks (each mask obtained with a separate area contrain)
+            mask_ = torch.cat(mask_hist[-3:])
+
+
+
+            mask_of_input_shape = mask_
+
+            # Resize saliency map.
+            mask_ = resize_saliency(input,
+                                    mask_,
+                                    resize,
+                                    mode=resize_mode)
+
+            # Smooth saliency map.
+            if smooth > 0:
+                mask_ = imsmooth(
+                    mask_,
+                    sigma=smooth * min(mask_.shape[2:]),
+                    padding_mode='constant'
+                )
+                mask_of_input_shape = imsmooth(
+                    mask_of_input_shape,
+                    sigma=smooth * min(mask_of_input_shape.shape[2:]),
+                    padding_mode='constant'
+                )
+
+            return mask_, None, mask_of_input_shape
+        elif use_smbo and reuse_ep_mask_generation:
+            from skopt import gp_minimize
+            from skopt.space import Real
+            from skopt.plots import plot_convergence
+
+            # Prepare reference area vector.
+            max_area = np.prod(mask_generator.shape_out)
+            reference = torch.ones(len(areas), max_area).to(device)
             for i, a in enumerate(areas):
-                plt.figure(i, figsize=(20, 6))
-                plt.clf()
-                ncols = 4 if variant == DUAL_VARIANT else 3
-                plt.subplot(1, ncols, 1)
-                plt.plot(hist[i, 0].numpy())
-                plt.plot(hist[i, 1].numpy())
-                plt.plot(hist[i].sum(dim=0).numpy())
-                plt.legend(('energy', 'regul', 'both'))
-                plt.title(f'target area:{a:.2f}')
-                plt.subplot(1, ncols, 2)
-                imsc(mask[i], lim=[0, 1])
-                plt.title(
-                    f"min:{mask[i].min().item():.2f}"
-                    f" max:{mask[i].max().item():.2f}"
-                    f" area:{mask[i].sum() / mask[i].numel():.2f}")
-                plt.subplot(1, ncols, 3)
-                imsc(x[i])
-                if variant == DUAL_VARIANT:
-                    plt.subplot(1, ncols, 4)
-                    imsc(x[i + len(areas)])
-                plt.pause(0.001)
+                reference[i, :int(max_area * (1 - a))] = 0
 
-    mask_ = mask_.detach()
+            def generate_plot_mask(pmask_flatten, debug=False):
+                pmask = np.array(pmask_flatten).reshape(1, 1, h, w)
 
-    # Resize saliency map.
-    mask_ = resize_saliency(input,
-                            mask_,
-                            resize,
-                            mode=resize_mode)
+                pmask = torch.tensor(pmask, dtype=torch.float32).to(device)
+                mask_, mask = mask_generator.generate(pmask)
+                # Apply the mask.
+                if variant == DELETE_VARIANT:
+                    x = perturbation.apply(1 - mask_)
+                elif variant == PRESERVE_VARIANT:
+                    x = perturbation.apply(mask_)
+                elif variant == DUAL_VARIANT:
+                    x = torch.cat((
+                        perturbation.apply(mask_),
+                        perturbation.apply(1 - mask_),
+                    ), dim=0)
+                else:
+                    assert False
 
-    # Smooth saliency map.
-    if smooth > 0:
-        mask_ = imsmooth(
-            mask_,
-            sigma=smooth * min(mask_.shape[2:]),
-            padding_mode='constant'
-        )
+                # Evaluate the model on the masked data.
+                y = model(x)
+                y = F.softmax(y, dim=1)
+                target_class_prediction_score = y[:, target, :, :]
+                print('target class prediction', target_class_prediction_score)
 
-    return mask_, hist
+                if debug:
+                    for i, a in enumerate(areas):
+                        plt.figure(i, figsize=(20, 12))
+                        plt.clf()
+                        ncols = 2
+                        plt.subplot(1, ncols, 1)
+                        imsc(mask[i], lim=[0, 1])
+                        plt.title(
+                            f"min:{mask[i].min().item():.2f}"
+                            f" max:{mask[i].max().item():.2f}"
+                            f" area:{mask[i].sum() / mask[i].numel():.2f}")
+                        plt.subplot(1, ncols, 2)
+                        imsc(x[i])
+                        plt.pause(0.001)
+
+                return mask_, mask, target_class_prediction_score
+            class GaussPMask():
+                def __init__(self, H, W, areas):
+                    self.num_masks = len(areas)
+                    self.H = H
+                    self.W = W
+
+                    h = np.linspace(0, 1, self.H)
+                    w = np.linspace(0, 1, self.W)
+                    self.h, self.w = np.meshgrid(w, h)
+
+                    # self.mh = (torch.tensor([0.5] * self.num_masks))
+                    # self.mw = (torch.tensor([0.5] * self.num_masks))
+
+                    # # sigma_scale = 0.02 # 0.05 optimal for area regul
+                    # self.sh = np.array([0.9] * self.num_masks)  # sigma_scale * H
+                    # self.sw = np.array([0.9] * self.num_masks)  # !!!!!
+
+                    # self.gauss_scale = (torch.tensor([9.] * self.num_masks))
+
+                def _gaussian_2d(self, i):
+                    # # https://stackoverflow.com/questions/11615664/multivariate-normal-density-in-python
+                    # # https://peterroelants.github.io/posts/multivariate-normal-primer/
+                    # covariance = torch.tensor([
+                    #     [self.sh[i], 0],
+                    #     [0, self.sw[i]]
+                    # ])
+                    # A = 1. / (torch.sqrt((2 * math.pi) ** 2 * torch.det(covariance)))
+                    # B = (-1/2) * ((x-mu).T.dot(torch.inverse(cov))).dot((x-mu))
+                    A = 1 / (2 * math.pi * self.sh[i] * self.sw[i])
+                    B = (self.h - self.mh[i]) ** 2 / (2 * self.sh[i] ** 2)
+                    C = (self.w - self.mw[i]) ** 2 / (2 * self.sw[i] ** 2)
+                    return A * np.exp(-(B + C))
+
+                def generate_pmask(self, gauss_params, g_scale=1.2):
+                    # mh, mw = gauss_params
+                    # self.mh = np.array([mh] * self.num_masks)
+                    # self.mw = np.array([mw] * self.num_masks)
+
+                    # sh, sw = gauss_params
+                    # self.sh = np.array([sh] * self.num_masks)
+                    # self.sw = np.array([sw] * self.num_masks)
+                    # self.mh = np.array([0.5] * self.num_masks)
+                    # self.mw = np.array([0.5] * self.num_masks)
+
+                    mh, mw, sh, sw = gauss_params
+                    self.mh = np.array([mh] * self.num_masks)
+                    self.mw = np.array([mw] * self.num_masks)
+                    self.sh = np.array([sh] * self.num_masks)
+                    self.sw = np.array([sw] * self.num_masks)
+
+                    pmask = np.zeros([len(areas), self.H, self.W])
+                    for i in range(self.num_masks):
+                        z = self._gaussian_2d(i)
+                        pmask[i] = (z / z.max()) * g_scale
+                        # pmask[i] = z * self.gauss_scale[i]
+                        # pmask[i] = z
+                        # z_ = pmask[i].detach().cpu().numpy()
+                    pmask = np.expand_dims(pmask, 1)
+                    return pmask
+
+            t = 0
+            sigma_upper_bound = 0.5
+            regul_area_weight = 300
+
+
+            # reference_covariance_det_vals = np.linspace(sigma_upper_bound**2, reference_covariance_det_target, num_score_area_iter)
+            reference_covariance_det_vals = np.array([0.25, 0.16, 0.08, 0.04, 0.02, 0.01, 0.005, 0.0025, 0.001]) # , 0.005, 0.0025, 0.001
+            num_score_area_iter = len(reference_covariance_det_vals)
+
+
+            def ep_func(pmask_flatten, area_penalty=True):
+                nonlocal t
+                nonlocal regul_area_weight
+                pmask = np.array(pmask_flatten).reshape(1, 1, h, w)
+
+                pmask = torch.tensor(pmask, dtype=torch.float32).to(device)
+
+                # print('pmask stats:', pmask.min(), pmask.max(), pmask.mean())
+
+                # Generate the mask.
+                mask_, mask = mask_generator.generate(pmask)
+
+                # Apply the mask.
+                if variant == DELETE_VARIANT:
+                    x = perturbation.apply(1 - mask_)
+                elif variant == PRESERVE_VARIANT:
+                    x = perturbation.apply(mask_)
+                elif variant == DUAL_VARIANT:
+                    x = torch.cat((
+                        perturbation.apply(mask_),
+                        perturbation.apply(1 - mask_),
+                    ), dim=0)
+                else:
+                    assert False
+
+                # # Apply jitter to the masked data.
+                # if jitter and t % 2 == 0:
+                #     x = torch.flip(x, dims=(3,))
+
+                # Evaluate the model on the masked data.
+                # with torch.no_grad():
+                y = model(x)
+                # TODO: will softmax work better?
+                # y = F.softmax(y, dim=1)
+
+                # Get reward.
+                reward = reward_func(y, target, variant=variant)
+                # Reshape reward and average over spatial dimensions.
+                reward = reward.reshape(len(areas), -1).mean(dim=1) #* reward_weight
+                # print('reward_weight', reward_weight)
+                # reward_weight = 0.98 * reward_weight
+
+                # Area regularization.
+                if area_penalty:
+                    mask_sorted = mask.reshape(len(areas), -1).sort(dim=1)[0]
+                    regul_area = - ((mask_sorted - reference) ** 2).mean(dim=1) * regul_area_weight
+                    # print('reference_covariance_det', reference_covariance_det)
+                    # print('regul_area_weight', regul_area_weight)
+                    # regul_area_weight *= 1.2
+                    # if t in [25, 50, 75]:
+                    #     regul_area_weight *= 5
+                    # # Warm up. Give time for localization
+                    # if t < 10:
+                    #     regul_area = regul_area * 0.0001
+                else:
+                    regul_area = 0
+
+                # regul_gauss = - ((gauss_pmask_generator.sh - gauss_pmask_generator.sw) ** 2) * 1000
+                # print('reward Energy', reward.detach().data.cpu().numpy())
+                # print('regul_area Energy', regul_area)
+                energy = (reward + regul_area).sum() #  + regul_area
+                # energy = (regul_area)  # + regul_area
+
+                score = - energy
+                t += 1
+
+                return score.item()
+                # return score
+
+
+            y = model(input)
+            y = F.softmax(y, dim=1)
+            print('[Non perturbed image] target class prediction', y[:, target, :, :])
+            mask_hist = []
+
+
+            # Optimize score w/o area penalty
+            bounds = [Real(low=0.0, high=1.0) for _ in range(h * w)]
+            x0 = list(np.ones(h * w))
+            res = gp_minimize(ep_func, bounds, x0=x0, acq_func="PI", n_calls=20, n_initial_points=10, random_state=1234, noise=1e-10)
+            if debug:
+                print('res.x', res.x)
+                print('res.fun', res.fun)
+                # plot_convergence(res)
+                # plt.show()
+            mask_, mask, target_class_prediction_score = generate_plot_mask(res.x, debug)
+
+            for i in range(5):
+                x0 = res.x
+                res = gp_minimize(ep_func, bounds, x0=x0, acq_func="PI", n_calls=20, n_initial_points=10, random_state=1234,
+                                  noise=1e-10)
+                if debug:
+                    print('res.x', res.x)
+                    print('res.fun', res.fun)
+                    # plot_convergence(res)
+                    # plt.show()
+                mask_, mask, target_class_prediction_score = generate_plot_mask(res.x, debug)
+                regul_area_weight *= 1.25
+
+            mask_of_input_shape = mask_
+
+            # Resize saliency map.
+            mask_ = resize_saliency(input,
+                                    mask_,
+                                    resize,
+                                    mode=resize_mode)
+
+            # Smooth saliency map.
+            if smooth > 0:
+                mask_ = imsmooth(
+                    mask_,
+                    sigma=smooth * min(mask_.shape[2:]),
+                    padding_mode='constant'
+                )
+                mask_of_input_shape = imsmooth(
+                    mask_of_input_shape,
+                    sigma=smooth * min(mask_of_input_shape.shape[2:]),
+                    padding_mode='constant'
+                )
+
+            return mask_, None, mask_of_input_shape
+        if use_smbo and mix_of_gauss:
+            from skopt import gp_minimize, forest_minimize
+            from skopt.space import Real
+            from skopt.plots import plot_convergence
+            from dlib import find_min_global
+
+            areas = [0.2]
+            random_state = 1234
+
+            def generate_plot_mask(gauss_params, debug=False):
+                pmask = GaussPMask(h, w, areas).generate_pmask(gauss_params)
+                pmask = np.clip(pmask, 0, 1)
+                pmask = torch.tensor(pmask, dtype=torch.float32).to(device)
+                mask_, mask = mask_generator.generate(pmask)
+                # Apply the mask.
+                if variant == DELETE_VARIANT:
+                    x = perturbation.apply(1 - mask_)
+                elif variant == PRESERVE_VARIANT:
+                    x = perturbation.apply(mask_)
+                elif variant == DUAL_VARIANT:
+                    x = torch.cat((
+                        perturbation.apply(mask_),
+                        perturbation.apply(1 - mask_),
+                    ), dim=0)
+                else:
+                    assert False
+
+                # Evaluate the model on the masked data.
+                y = model(x)
+                y = F.softmax(y, dim=1)
+                target_class_prediction_score = y[:, target, :, :]
+                print('target class prediction', target_class_prediction_score)
+
+                if debug:
+                    for i, a in enumerate(areas):
+                        plt.figure(i, figsize=(20, 12))
+                        plt.clf()
+                        ncols = 2
+                        plt.subplot(1, ncols, 1)
+                        imsc(mask[i], lim=[0, 1])
+                        plt.title(
+                            f"min:{mask[i].min().item():.2f}"
+                            f" max:{mask[i].max().item():.2f}"
+                            f" area:{mask[i].sum() / mask[i].numel():.2f}")
+                        plt.subplot(1, ncols, 2)
+                        imsc(x[i])
+                        plt.pause(0.001)
+
+                return mask_, mask, target_class_prediction_score
+
+            class GaussPMask():
+                def __init__(self, H, W, areas):
+                    self.num_masks = len(areas)
+                    self.H = H
+                    self.W = W
+
+                    h = np.linspace(0, 1, self.H)
+                    w = np.linspace(0, 1, self.W)
+                    self.h, self.w = np.meshgrid(w, h)
+
+                    # self.mh = (torch.tensor([0.5] * self.num_masks))
+                    # self.mw = (torch.tensor([0.5] * self.num_masks))
+
+                    # # sigma_scale = 0.02 # 0.05 optimal for area regul
+                    # self.sh = np.array([0.9] * self.num_masks)  # sigma_scale * H
+                    # self.sw = np.array([0.9] * self.num_masks)  # !!!!!
+
+                    # self.gauss_scale = (torch.tensor([9.] * self.num_masks))
+
+                def _gaussian_2d(self, i):
+                    # # https://stackoverflow.com/questions/11615664/multivariate-normal-density-in-python
+                    # # https://peterroelants.github.io/posts/multivariate-normal-primer/
+                    # covariance = torch.tensor([
+                    #     [self.sh[i], 0],
+                    #     [0, self.sw[i]]
+                    # ])
+                    # A = 1. / (torch.sqrt((2 * math.pi) ** 2 * torch.det(covariance)))
+                    # B = (-1/2) * ((x-mu).T.dot(torch.inverse(cov))).dot((x-mu))
+                    A = 1 / (2 * math.pi * self.sh[i] * self.sw[i])
+                    B = (self.h - self.mh[i]) ** 2 / (2 * self.sh[i] ** 2)
+                    C = (self.w - self.mw[i]) ** 2 / (2 * self.sw[i] ** 2)
+                    return A * np.exp(-(B + C))
+
+                def generate_pmask(self, gausses_params, g_scale=1.2):
+                    # mh, mw = gauss_params
+                    # self.mh = np.array([mh] * self.num_masks)
+                    # self.mw = np.array([mw] * self.num_masks)
+
+                    # sh, sw = gauss_params
+                    # self.sh = np.array([sh] * self.num_masks)
+                    # self.sw = np.array([sw] * self.num_masks)
+                    # self.mh = np.array([0.5] * self.num_masks)
+                    # self.mw = np.array([0.5] * self.num_masks)
+
+                    pmask = np.zeros([len(areas), self.H, self.W])
+                    for gauss_params in gausses_params:
+                        mh, mw, sh, sw = gauss_params
+                        self.mh = np.array([mh] * self.num_masks)
+                        self.mw = np.array([mw] * self.num_masks)
+                        self.sh = np.array([sh] * self.num_masks)
+                        self.sw = np.array([sw] * self.num_masks)
+                        for i in range(self.num_masks):
+                            z = self._gaussian_2d(i)
+                            pmask[i] += (z / z.max()) * g_scale
+                            # pmask[i] = z * self.gauss_scale[i]
+                            # pmask[i] = z
+                            # z_ = pmask[i].detach().cpu().numpy()
+                    pmask = np.expand_dims(pmask, 1)
+                    return pmask
+
+            t = 0
+
+            # reference_covariance_det_vals = np.linspace(sigma_upper_bound**2, reference_covariance_det_target, num_score_area_iter)
+            # reference_covariance_det_vals = np.array([0.25, 0.16, 0.08, 0.04, 0.02, 0.01, 0.005, 0.0025, 0.001]) # , 0.005, 0.0025, 0.001
+            # num_score_area_iter = len(reference_covariance_det_vals)
+
+            gauss_num = 3
+
+            acq_func = 'LCB' # LCB
+            sigma_upper_bound = 0.2
+
+            smbo_time_hist = []
+            smbo_time = time.time()
+
+            # def ep_func(gauss_params, area_penalty=True, optimize_sigma=True):
+            def ep_func(mh, mw, mh1, mw1, mh2, mw2):
+                gauss_params = [mh, mw, mh1, mw1, mh2, mw2]
+
+
+                area_penalty = False
+                optimize_sigma = False
+                nonlocal t
+                nonlocal regul_area_weight
+                nonlocal smbo_time
+                print('\ngauss_params', gauss_params)
+                print(t)
+
+                t = time.time() - smbo_time
+                print('smbo_time', t)
+                smbo_time_hist.append(t)
+                smbo_time = time.time()
+
+                tic_ = time.time()
+                print('start ep_func', tic_)
+                if not area_penalty and not optimize_sigma:
+                    params = []
+                    for mh, mw in zip(gauss_params[::2], gauss_params[1::2]):
+                        params.append((mh, mw, sigma_upper_bound, sigma_upper_bound))
+                    gauss_params = params
+                else:
+                    params = []
+                    for mh, mw, sigma in zip(gauss_params[::3], gauss_params[1::3], gauss_params[2::3]):
+                        params.append((mh, mw, sigma, sigma))
+                    gauss_params = params
+                pmask = GaussPMask(h, w, areas).generate_pmask(gauss_params)
+                pmask = np.clip(pmask, 0, 1)
+
+                pmask = torch.tensor(pmask, dtype=torch.float32).to(device)
+
+                # print('pmask stats:', pmask.min(), pmask.max(), pmask.mean())
+
+                # Generate the mask.
+                mask_, mask = mask_generator.generate(pmask)
+
+                # Apply the mask.
+                if variant == DELETE_VARIANT:
+                    x = perturbation.apply(1 - mask_)
+                elif variant == PRESERVE_VARIANT:
+                    x = perturbation.apply(mask_)
+                elif variant == DUAL_VARIANT:
+                    x = torch.cat((
+                        perturbation.apply(mask_),
+                        perturbation.apply(1 - mask_),
+                    ), dim=0)
+                else:
+                    assert False
+
+                # # Apply jitter to the masked data.
+                # if jitter and t % 2 == 0:
+                #     x = torch.flip(x, dims=(3,))
+
+                # Evaluate the model on the masked data.
+                # with torch.no_grad():
+                y = model(x)
+                # TODO: will softmax work better?
+                # y = F.softmax(y, dim=1)
+
+                # Get reward.
+                reward = reward_func(y, target, variant=variant)
+                # Reshape reward and average over spatial dimensions.
+                reward = reward.reshape(len(areas), -1).mean(dim=1) #* reward_weight
+                # print('reward_weight', reward_weight)
+                # reward_weight = 0.98 * reward_weight
+
+                # Area regularization.
+                if area_penalty:
+                    covariance_det = 0
+                    for _, _, sh, sw in gauss_params:
+                         covariance_det += sh * sw
+                    regul_area = - ((covariance_det - reference_covariance_det) ** 2) * regul_area_weight
+                else:
+                    regul_area = 0
+
+                # regul_gauss = - ((gauss_pmask_generator.sh - gauss_pmask_generator.sw) ** 2) * 1000
+                print('reward Energy', reward.detach().data.cpu().numpy())
+                print('regul_area Energy', regul_area)
+                energy = (reward + regul_area).sum() #  + regul_area
+                # energy = (regul_area)  # + regul_area
+
+                score = - energy
+                t += 1
+
+                print('finish ep_func', time.time() - tic_)
+
+                return score.item()
+                # return score
+
+            def ep_func_area(mh, mw, sigma, mh1, mw1, sigma1, mh2, mw2, sigma2):
+                gauss_params = [mh, mw, sigma, mh1, mw1, sigma1, mh2, mw2, sigma2]
+                area_penalty = True
+                optimize_sigma = True
+                nonlocal t
+                nonlocal regul_area_weight
+                nonlocal smbo_time
+                print('\ngauss_params', gauss_params)
+                print(t)
+
+                t = time.time() - smbo_time
+                print('smbo_time', t)
+                smbo_time_hist.append(t)
+                smbo_time = time.time()
+
+                tic_ = time.time()
+                print('start ep_func', tic_)
+                params = []
+                for mh, mw, sigma in zip(gauss_params[::3], gauss_params[1::3], gauss_params[2::3]):
+                    params.append((mh, mw, sigma, sigma))
+                gauss_params = params
+                pmask = GaussPMask(h, w, areas).generate_pmask(gauss_params)
+                pmask = np.clip(pmask, 0, 1)
+
+                pmask = torch.tensor(pmask, dtype=torch.float32).to(device)
+
+                # print('pmask stats:', pmask.min(), pmask.max(), pmask.mean())
+
+                # Generate the mask.
+                mask_, mask = mask_generator.generate(pmask)
+
+                # Apply the mask.
+                if variant == DELETE_VARIANT:
+                    x = perturbation.apply(1 - mask_)
+                elif variant == PRESERVE_VARIANT:
+                    x = perturbation.apply(mask_)
+                elif variant == DUAL_VARIANT:
+                    x = torch.cat((
+                        perturbation.apply(mask_),
+                        perturbation.apply(1 - mask_),
+                    ), dim=0)
+                else:
+                    assert False
+
+                # # Apply jitter to the masked data.
+                # if jitter and t % 2 == 0:
+                #     x = torch.flip(x, dims=(3,))
+
+                # Evaluate the model on the masked data.
+                # with torch.no_grad():
+                y = model(x)
+                # TODO: will softmax work better?
+                # y = F.softmax(y, dim=1)
+
+                # Get reward.
+                reward = reward_func(y, target, variant=variant)
+                # Reshape reward and average over spatial dimensions.
+                reward = reward.reshape(len(areas), -1).mean(dim=1) #* reward_weight
+                # print('reward_weight', reward_weight)
+                # reward_weight = 0.98 * reward_weight
+
+                # Area regularization.
+                if area_penalty:
+                    covariance_det = 0
+                    for _, _, sh, sw in gauss_params:
+                         covariance_det += sh * sw
+                    regul_area = - ((covariance_det - reference_covariance_det) ** 2) * regul_area_weight
+                else:
+                    regul_area = 0
+
+                # regul_gauss = - ((gauss_pmask_generator.sh - gauss_pmask_generator.sw) ** 2) * 1000
+                print('reward Energy', reward.detach().data.cpu().numpy())
+                print('regul_area Energy', regul_area)
+                energy = (reward + regul_area).sum() #  + regul_area
+                # energy = (regul_area)  # + regul_area
+
+                score = - energy
+                t += 1
+
+                print('finish ep_func', time.time() - tic_)
+
+                return score.item()
+                # return score
+
+
+            y = model(input)
+            y = F.softmax(y, dim=1)
+            print('[Non perturbed image] target class prediction', y[:, target, :, :])
+            mask_hist = []
+
+
+
+
+
+            # Optimize score w/o area penalty
+            print('Start Optimize score w/o area penalty')
+            tic = time.time()
+            n_calls = 50
+            n_initial_points = 10
+            bounds = []
+            for _ in range(gauss_num):
+                bounds.extend([Real(low=0.0, high=1.0), Real(low=0.0, high=1.0)])
+            # res = gp_minimize(partial(ep_func, area_penalty=False, optimize_sigma=False), bounds, acq_func=acq_func, n_calls=n_calls, n_initial_points=n_initial_points, random_state=random_state, noise=1e-10)
+            # res = forest_minimize(partial(ep_func, area_penalty=False, optimize_sigma=False), bounds, acq_func=acq_func, n_calls=n_calls, n_initial_points=n_initial_points, random_state=random_state)
+
+            # res_ = find_min_global(ep_func, [0, 0, 0, 0, 0, 0], [1, 1, 1, 1, 1, 1], num_function_calls=n_calls)
+            reference_covariance_det = 0.2 * 0.2 * gauss_num
+            regul_area_weight = 100
+            res_ = find_min_global(ep_func_area, [0, 0, 0.199, 0, 0, 0.199, 0, 0, 0.199], [1, 1, 0.2, 1, 1, 0.2, 1, 1, 0.2], num_function_calls=n_calls)
+            res = lambda: None
+            res.x = res_[0]
+            res.fun = res_[1]
+
+            if debug:
+                print('res.x', res.x)
+                print('res.fun', res.fun)
+                plot_convergence(res)
+                plt.show()
+            res_gausses_params = []
+            for mh, mw in zip(res.x[::2], res.x[1::2]):
+                res_gausses_params.append((mh, mw, sigma_upper_bound, sigma_upper_bound))
+            mask_, mask, target_class_prediction_score = generate_plot_mask(res_gausses_params, debug)
+            mask_hist.append((mask_, target_class_prediction_score))
+            print('Stop Optimize score w/o area penalty', time.time() - tic)
+
+
+
+
+
+            # Optimize score w/ area penalty 1
+            n_calls = 20
+            n_initial_points = 1
+            t = 0
+            regul_area_weight = 300
+            sigma_target = 0.12
+            sigma_min = 0.07
+            reference_covariance_det = sigma_target * sigma_target * gauss_num
+            bounds = []
+            for _ in range(gauss_num):
+                bounds.extend([Real(low=0.0, high=1.0), Real(low=0.0, high=1.0), Real(low=sigma_min, high=sigma_upper_bound)])
+
+            x0 = []
+            for iter in res.x_iters:
+                iter_res = []
+                for mh, mw in zip(iter[::2], iter[1::2]):
+                    iter_res.extend([mh, mw, sigma_upper_bound])
+                x0.append(iter_res)
+
+            regul_area = ((sigma_upper_bound * sigma_upper_bound * gauss_num - reference_covariance_det) ** 2) * regul_area_weight
+            y0 = [(func_val + regul_area) for func_val in res.func_vals]
+
+            # x0 = []
+            # for mh, mw in zip(res.x[::2], res.x[1::2]):
+            #     x0.extend([mh, mw, sigma_upper_bound])
+            # regul_area = ((sigma_upper_bound * sigma_upper_bound * gauss_num - reference_covariance_det) ** 2) * regul_area_weight
+            # y0 = res.fun + regul_area
+
+            res = gp_minimize(ep_func, bounds, x0=x0, y0=y0, acq_func=acq_func, n_calls=n_calls, n_initial_points=n_initial_points, random_state=random_state, noise=1e-10)
+            # res = forest_minimize(ep_func, bounds, x0=x0, y0=y0, acq_func=acq_func, n_calls=n_calls, n_initial_points=n_initial_points, random_state=random_state)
+            if debug:
+                print('res.x', res.x)
+                print('res.fun', res.fun)
+                plot_convergence(res)
+                plt.show()
+            res_gausses_params = []
+            for mh, mw, sigma in zip(res.x[::3], res.x[1::3], res.x[2::3]):
+                res_gausses_params.append((mh, mw, sigma, sigma))
+            mask_, mask, target_class_prediction_score = generate_plot_mask(res_gausses_params, debug)
+            mask_hist.append((mask_, target_class_prediction_score))
+
+
+
+
+
+            # Optimize score w/ area penalty 2
+            t = 0
+
+            regul_area_weight_prev = regul_area_weight
+            reference_covariance_det_prev = reference_covariance_det
+            regul_area_weight = 400
+            sigma_target = 0.07
+            sigma_min = 0.035
+            reference_covariance_det = sigma_target * sigma_target * gauss_num
+
+            x0 = []
+            regul_area_hist_prev = []
+            regul_area_hist = []
+            for iter in res.x_iters:
+                iter_res = []
+                regul = 0
+                for mh, mw, sigma in zip(iter[::3], iter[1::3], iter[2::3]):
+                    iter_res.extend([mh, mw, sigma])
+                    regul += sigma * sigma
+                x0.append(iter_res)
+                regul_area_hist_prev.append((((regul - reference_covariance_det_prev) ** 2) * regul_area_weight_prev))
+                regul_area_hist.append((((regul - reference_covariance_det) ** 2) * regul_area_weight))
+
+            y0 = [(func_val - regul_area_prev + regul_area) for func_val, regul_area_prev, regul_area in zip(res.func_vals, regul_area_hist_prev, regul_area_hist)]
+
+            bounds = []
+            for _ in range(gauss_num):
+                bounds.extend([Real(low=0.0, high=1.0), Real(low=0.0, high=1.0), Real(low=sigma_min, high=sigma_upper_bound)])
+            res = gp_minimize(ep_func, bounds, x0=x0, y0=y0, acq_func=acq_func, n_calls=n_calls, n_initial_points=n_initial_points, random_state=random_state, noise=1e-10)
+            # res = forest_minimize(ep_func, bounds, x0=x0, y0=y0, acq_func=acq_func, n_calls=n_calls, n_initial_points=n_initial_points, random_state=random_state)
+            if debug:
+                print('res.x', res.x)
+                print('res.fun', res.fun)
+                plot_convergence(res)
+                plt.show()
+            res_gausses_params = []
+            for mh, mw, sigma in zip(res.x[::3], res.x[1::3], res.x[2::3]):
+                res_gausses_params.append((mh, mw, sigma, sigma))
+            mask_, mask, target_class_prediction_score = generate_plot_mask(res_gausses_params, debug)
+            mask_hist.append((mask_, target_class_prediction_score))
+
+
+
+
+
+
+
+
+            # Optimize score w/ area penalty 3
+            t = 0
+
+            regul_area_weight_prev = regul_area_weight
+            reference_covariance_det_prev = reference_covariance_det
+            regul_area_weight = 500
+            sigma_target = 0.035
+            sigma_min = 0.02
+            reference_covariance_det = sigma_target * sigma_target * gauss_num
+
+            x0 = []
+            regul_area_hist_prev = []
+            regul_area_hist = []
+            for iter in res.x_iters:
+                iter_res = []
+                regul = 0
+                for mh, mw, sigma in zip(iter[::3], iter[1::3], iter[2::3]):
+                    iter_res.extend([mh, mw, sigma])
+                    regul += sigma * sigma
+                x0.append(iter_res)
+                regul_area_hist_prev.append((((regul - reference_covariance_det_prev) ** 2) * regul_area_weight_prev))
+                regul_area_hist.append((((regul - reference_covariance_det) ** 2) * regul_area_weight))
+
+            y0 = [(func_val - regul_area_prev + regul_area) for func_val, regul_area_prev, regul_area in zip(res.func_vals, regul_area_hist_prev, regul_area_hist)]
+
+            bounds = []
+            for _ in range(gauss_num):
+                bounds.extend([Real(low=0.0, high=1.0), Real(low=0.0, high=1.0), Real(low=sigma_min, high=sigma_upper_bound)])
+            res = gp_minimize(ep_func, bounds, x0=x0, y0=y0, acq_func=acq_func, n_calls=n_calls, n_initial_points=n_initial_points, random_state=random_state, noise=1e-10)
+            # res = forest_minimize(ep_func, bounds, x0=x0, y0=y0, acq_func=acq_func, n_calls=n_calls, n_initial_points=n_initial_points, random_state=random_state)
+            if debug:
+                print('res.x', res.x)
+                print('res.fun', res.fun)
+                plot_convergence(res)
+                plt.show()
+            res_gausses_params = []
+            for mh, mw, sigma in zip(res.x[::3], res.x[1::3], res.x[2::3]):
+                res_gausses_params.append((mh, mw, sigma, sigma))
+            mask_, mask, target_class_prediction_score = generate_plot_mask(res_gausses_params, debug)
+            mask_hist.append((mask_, target_class_prediction_score))
+
+
+
+
+
+            # # Optimize score w/ area penalty 4
+            # t = 0
+            #
+            # regul_area_weight_prev = regul_area_weight
+            # reference_covariance_det_prev = reference_covariance_det
+            # regul_area_weight = 2000
+            # sigma_target = 0.01
+            # reference_covariance_det = sigma_target * sigma_target * gauss_num
+            #
+            # x0 = []
+            # regul_area_hist_prev = []
+            # regul_area_hist = []
+            # for iter in res.x_iters:
+            #     iter_res = []
+            #     regul = 0
+            #     for mh, mw, sh, sw in zip(iter[::4], iter[1::4], iter[2::4], iter[3::4]):
+            #         iter_res.extend([mh, mw, sh, sw])
+            #         regul += sh * sw
+            #     x0.append(iter_res)
+            #     regul_area_hist_prev.append((((regul - reference_covariance_det_prev) ** 2) * regul_area_weight_prev))
+            #     regul_area_hist.append((((regul - reference_covariance_det) ** 2) * regul_area_weight))
+            #
+            # y0 = [(func_val - regul_area_prev + regul_area) for func_val, regul_area_prev, regul_area in zip(res.func_vals, regul_area_hist_prev, regul_area_hist)]
+            #
+            # bounds = []
+            # for _ in range(gauss_num):
+            #     bounds.extend([Real(low=0.0, high=1.0), Real(low=0.0, high=1.0), Real(low=0.001, high=0.2), Real(low=0.001, high=0.2)])
+            # res = gp_minimize(ep_func, bounds, x0=x0, y0=y0, acq_func=acq_func, n_calls=n_calls, n_initial_points=n_initial_points, random_state=random_state, noise=1e-10)
+            # if debug:
+            #     print('res.x', res.x)
+            #     print('res.fun', res.fun)
+            #     plot_convergence(res)
+            #     plt.show()
+            # res_gausses_params = []
+            # for mh, mw, sh, sw in zip(res.x[::4], res.x[1::4], res.x[2::4], res.x[3::4]):
+            #     res_gausses_params.append((mh, mw, sh, sw))
+            # mask_, mask, target_class_prediction_score = generate_plot_mask(res_gausses_params, debug)
+            # mask_hist.append((mask_, target_class_prediction_score))
+
+
+
+
+
+
+
+            # # Optimize score + area
+            # for i in range(num_score_area_iter - 1):
+            #     print('\niter', i)
+            #     t = 0
+            #     reference_covariance_det = reference_covariance_det_vals[i + 1]
+            #     sigma = math.sqrt(reference_covariance_det)
+            #     # if i == 0:
+            #     #     x0_sigma_h = x0_sigma_w = sigma_upper_bound
+            #     # else:
+            #     #     ratio = res.x[2]/res.x[3]
+            #     #     x0_sigma_h = math.sqrt(reference_covariance_det * ratio)
+            #     #     x0_sigma_w = x0_sigma_h / ratio
+            #     #     # x0_sigma_h = res.x[2]
+            #     #     # x0_sigma_w = res.x[3]
+            #     mean_range = sigma
+            #     sigma_range = sigma/5
+            #     bounds = [
+            #               Real(low=max(0, res.x[0] - mean_range), high=min(1, res.x[0] + mean_range)),
+            #               Real(low=max(0, res.x[1] - mean_range), high=min(1, res.x[1] + mean_range)),
+            #               Real(low=sigma - sigma_range, high=sigma + sigma_range),
+            #               Real(low=sigma - sigma_range, high=sigma + sigma_range),
+            #               # Real(low=max(0, res.x[0] - x0_sigma_h/2), high=min(1, res.x[0] + x0_sigma_h/2)),
+            #               # Real(low=max(0, res.x[1] - x0_sigma_w/2), high=min(1, res.x[1] + x0_sigma_w/2)),
+            #               # Real(low=x0_sigma_h - sigma_range, high=x0_sigma_h + sigma_range),
+            #               # Real(low=x0_sigma_w - sigma_range, high=x0_sigma_w + sigma_range)
+            #               ]
+            #     # print('bounds', bounds)
+            #     x0 = [res.x[0], res.x[1], sigma, sigma]
+            #     # x0 = [res.x[0], res.x[1], x0_sigma_h, x0_sigma_w]
+            #     # x0 = [res.x[0], res.x[1]]
+            #     # x0 = None
+            #     res = gp_minimize(partial(ep_func, area_penalty=False), bounds, x0=x0, acq_func="PI", n_calls=12, n_initial_points=5, random_state=random_state, noise=1e-10)
+            #     if debug:
+            #         print('res.x', res.x)
+            #         print('res.fun', res.fun)
+            #         # plot_convergence(res)
+            #         # plt.show()
+            #     mask_, mask, target_class_prediction_score = generate_plot_mask(res.x, debug)
+            #
+            #     # if target_class_prediction_score < 0.2:
+            #     #     print('target_class_prediction_score go below 0.2 -> Break!')
+            #     #     break
+            #
+            #     # TODO: which g_scale to use?
+            #     pmask = GaussPMask(h, w, areas).generate_pmask(res.x, g_scale=1.2)
+            #     pmask = torch.tensor(pmask, dtype=torch.float32).to(device)
+            #     mask_, mask = mask_generator.generate(pmask)
+            #     mask_hist.append((mask_, target_class_prediction_score))
+            #     # mask_, mask, target_class_prediction_score = generate_plot_mask([res.x[0], res.x[1], sigma, sigma])
+            #
+            # mask_hist = [mask for (mask, score) in mask_hist if score > 0.1]
+            #
+            # # Combine 3 last masks (each mask obtained with a separate area contrain)
+            # mask_ = torch.cat(mask_hist[-3:])
+
+
+
+            mask_of_input_shape = mask_
+
+            # Resize saliency map.
+            mask_ = resize_saliency(input,
+                                    mask_,
+                                    resize,
+                                    mode=resize_mode)
+
+            # Smooth saliency map.
+            if smooth > 0:
+                mask_ = imsmooth(
+                    mask_,
+                    sigma=smooth * min(mask_.shape[2:]),
+                    padding_mode='constant'
+                )
+                mask_of_input_shape = imsmooth(
+                    mask_of_input_shape,
+                    sigma=smooth * min(mask_of_input_shape.shape[2:]),
+                    padding_mode='constant'
+                )
+
+            return mask_, None, mask_of_input_shape
+        else:
+            class GaussPMask(torch.nn.Module):
+                def __init__(self, H, W, areas):
+                    super(GaussPMask, self).__init__()
+                    self.num_masks = len(areas)
+                    self.H = H
+                    self.W = W
+
+                    h = torch.linspace(0, 1, self.H).to(device)
+                    w = torch.linspace(0, 1, self.W).to(device)
+                    self.h, self.w = torch.meshgrid(h, w)
+
+                    self.mh = torch.nn.Parameter(torch.tensor([0.5] * self.num_masks))
+                    self.mw = torch.nn.Parameter(torch.tensor([0.5] * self.num_masks))
+
+                    # sigma_scale = 0.02 # 0.05 optimal for area regul
+                    self.sh = torch.nn.Parameter(torch.tensor([0.9] * self.num_masks)) # sigma_scale * H
+                    self.sw = torch.nn.Parameter(torch.tensor([0.9] * self.num_masks))  # !!!!!
+                    # self.sh = torch.nn.Parameter(torch.tensor([0.5] * self.num_masks))
+                    # self.sw = torch.nn.Parameter(torch.tensor([0.5] * self.num_masks))
+
+                    # self.gauss_scale = (torch.tensor([9.] * self.num_masks))
+
+                def get_covariance(self):
+                    return torch.tensor([
+                        [self.sh, 0],
+                        [0, self.sw]
+                    ])
+
+                def _gaussian_2d(self, i):
+                    # # https://stackoverflow.com/questions/11615664/multivariate-normal-density-in-python
+                    # # https://peterroelants.github.io/posts/multivariate-normal-primer/
+                    # covariance = torch.tensor([
+                    #     [self.sh[i], 0],
+                    #     [0, self.sw[i]]
+                    # ])
+                    # A = 1. / (torch.sqrt((2 * math.pi) ** 2 * torch.det(covariance)))
+                    # B = (-1/2) * ((x-mu).T.dot(torch.inverse(cov))).dot((x-mu))
+                    A = 1 / (2 * math.pi * self.sh[i] * self.sw[i])
+                    B = (self.h - self.mh[i]) ** 2 / (2 * self.sh[i] ** 2)
+                    C = (self.w - self.mw[i]) ** 2 / (2 * self.sw[i] ** 2)
+                    return A * torch.exp(-(B + C))
+
+                def forward(self):
+                    pmask = torch.zeros(len(areas), self.H, self.W).to(device)
+                    for i in range(self.num_masks):
+                        z = self._gaussian_2d(i)
+                        pmask[i] = (z / z.max()) * 1.2
+                        # pmask[i] = z * self.gauss_scale[i]
+                        # pmask[i] = z
+                        # z_ = pmask[i].detach().cpu().numpy()
+                    return pmask.unsqueeze(1)
+
+            gauss_pmask_generator = GaussPMask(h, w, areas)
+            gauss_pmask_generator.to(device)
+            pmask = gauss_pmask_generator()
+
+            for p in gauss_pmask_generator.named_parameters():
+                print(p)
+
+            if debug:
+                print(f"- mask resolution:\n  {pmask.shape}")
+
+            # Prepare reference area vector.
+            max_area = np.prod(mask_generator.shape_out)
+            reference = torch.ones(len(areas), max_area).to(device)
+            for i, a in enumerate(areas):
+                reference[i, :int(max_area * (1 - a))] = 0
+
+            # Initialize optimizer.
+            learning_rate = 0.03
+            # optimizer = optim.SGD(gauss_pmask_generator.parameters(),
+            #                       lr=learning_rate,
+            #                       momentum=momentum,
+            #                       dampening=momentum
+            #                       )
+            # optimizer = optim.SGD(gauss_pmask_generator.parameters(),
+            #                       lr=learning_rate)
+            optimizer = optim.Adam(gauss_pmask_generator.parameters(),
+                                  lr=learning_rate)
+            # scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[25, 50, 75], gamma=0.25)
+
+            hist = torch.zeros((len(areas), 2, 0))
+            reward_weight = 1
+            regul_area_weight = 50 # 10 is good
+            for t in range(max_iter):
+                print()
+                print(t)
+                for p in gauss_pmask_generator.named_parameters():
+                    print(p)
+                pmask = gauss_pmask_generator()
+
+                pmask.data = pmask.data.clamp(0, 1)
+
+                # print('pmask stats:', pmask.min().data, pmask.max().data, pmask.mean().data)
+
+                # Generate the mask.
+                mask_, mask = mask_generator.generate(pmask)
+
+                # Apply the mask.
+                if variant == DELETE_VARIANT:
+                    x = perturbation.apply(1 - mask_)
+                elif variant == PRESERVE_VARIANT:
+                    x = perturbation.apply(mask_)
+                elif variant == DUAL_VARIANT:
+                    x = torch.cat((
+                        perturbation.apply(mask_),
+                        perturbation.apply(1 - mask_),
+                    ), dim=0)
+                else:
+                    assert False
+
+                # # Apply jitter to the masked data.
+                # if jitter and t % 2 == 0:
+                #     x = torch.flip(x, dims=(3,))
+
+                # Evaluate the model on the masked data.
+                # with torch.no_grad():
+                y = model(x)
+                print('target class prediction', y[:, target, :, :])
+
+                # Get reward.
+                reward = reward_func(y, target, variant=variant)
+                # Reshape reward and average over spatial dimensions.
+                reward = reward.reshape(len(areas), -1).mean(dim=1) * reward_weight
+                print('reward_weight', reward_weight)
+                # reward_weight = 0.98 * reward_weight
+
+                # Area regularization.
+                # mask_sorted = mask.reshape(len(areas), -1).sort(dim=1)[0]
+                # regul_area = - ((mask_sorted - reference) ** 2).mean(dim=1) * regul_weight
+                covariance_det = gauss_pmask_generator.sh * gauss_pmask_generator.sw
+                reference_covariance_det = 0.05
+                regul_area = - ((covariance_det - reference_covariance_det) ** 2) * regul_area_weight
+                print('regul_area_weight', regul_area_weight)
+                regul_area_weight *= 1.05
+                # if t in [25, 50, 75]:
+                #     regul_area_weight *= 5
+                # # Warm up. Give time for localization
+                if t < 10:
+                    regul_area = regul_area * 0.0001
+
+                # regul_gauss = - ((gauss_pmask_generator.sh - gauss_pmask_generator.sw) ** 2) * 1000
+
+                print('reward Energy', reward.detach().data.cpu().numpy())
+                print('regul_area Energy', regul_area.detach().data.cpu().numpy())
+                energy = (reward + regul_area).sum()
+
+                # last_lr = scheduler.get_last_lr()
+                # print('last_lr', last_lr)
+
+                # Gradient step.
+                optimizer.zero_grad()
+                (- energy).backward()
+                optimizer.step()
+                # scheduler.step()
+
+                for name, p in gauss_pmask_generator.named_parameters():
+                    if name == 'mh':
+                        p.data = p.data.clamp(0, 1)
+                    if name == 'mw':
+                        p.data = p.data.clamp(0, 1)
+                    if name == 'sh':
+                        p.data = p.data.clamp(0.1, 1.5)
+                    if name == 'sw':
+                        p.data = p.data.clamp(0.1, 1.5)
+                    # if name == 'gauss_scale':
+                    #     p.data = p.data.clamp(0., 3000.)
+
+                print('sh * sw', gauss_pmask_generator.sh * gauss_pmask_generator.sw)
+                print('sh.grad, sw.grad', gauss_pmask_generator.sh.grad, gauss_pmask_generator.sw.grad)
+                print('mh.grad, mw.grad', gauss_pmask_generator.mh.grad, gauss_pmask_generator.mw.grad)
+
+                # Record energy.
+                hist = torch.cat(
+                    (hist,
+                     torch.cat((
+                         reward.detach().cpu().view(-1, 1, 1),
+                         regul_area.detach().cpu().view(-1, 1, 1)
+                     ), dim=1)), dim=2)
+
+                # # Adjust the regulariser/area constraint weight.
+                # regul_weight *= 1.0035
+
+                # Diagnostics.
+                debug_this_iter = debug and (t in (0, max_iter - 1)
+                                             or regul_weight / regul_weight_last >= 2)
+
+                # if (print_iter is not None and t % print_iter == 0) or debug_this_iter:
+                print("[{:04d}/{:04d}]".format(t + 1, max_iter), end="")
+                for i, area in enumerate(areas):
+                    print(" [area:{:.2f} loss:{:.2f} reg:{:.2f}]".format(
+                        area,
+                        hist[i, 0, -1],
+                        hist[i, 1, -1]), end="")
+                print()
+
+                debug_this_iter = (t % 10 == 0)
+                if debug_this_iter:
+                    regul_weight_last = regul_weight
+                    for i, a in enumerate(areas):
+                        plt.figure(i, figsize=(20, 6))
+                        plt.clf()
+                        ncols = 4 if variant == DUAL_VARIANT else 3
+                        plt.subplot(1, ncols, 1)
+                        plt.plot(hist[i, 0].numpy())     # target class score
+                        plt.plot(hist[i, 1].numpy())   # regul_area
+                        # plt.plot(hist[i].sum(dim=0).numpy())
+                        plt.legend(('taget_class_score', 'regul_area', 'both'))
+                        plt.title(f'target area:{a:.2f}')
+                        plt.subplot(1, ncols, 2)
+                        imsc(mask[i], lim=[0, 1])
+                        plt.title(
+                            f"min:{mask[i].min().item():.2f}"
+                            f" max:{mask[i].max().item():.2f}"
+                            f" area:{mask[i].sum() / mask[i].numel():.2f}")
+                        plt.subplot(1, ncols, 3)
+                        imsc(x[i])
+                        if variant == DUAL_VARIANT:
+                            plt.subplot(1, ncols, 4)
+                            imsc(x[i + len(areas)])
+                        plt.pause(0.001)
+
+
+
+
+
+            mask_ = mask_.detach()
+
+            mask_of_input_shape = mask_
+
+            # Resize saliency map.
+            mask_ = resize_saliency(input,
+                                    mask_,
+                                    resize,
+                                    mode=resize_mode)
+
+            # Smooth saliency map.
+            if smooth > 0:
+                mask_ = imsmooth(
+                    mask_,
+                    sigma=smooth * min(mask_.shape[2:]),
+                    padding_mode='constant'
+                )
+                mask_of_input_shape = imsmooth(
+                    mask_of_input_shape,
+                    sigma=smooth * min(mask_of_input_shape.shape[2:]),
+                    padding_mode='constant'
+                )
+
+            return mask_, hist, mask_of_input_shape
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        # class GaussPMask(torch.nn.Module):
+        #     def __init__(self, H, W, areas):
+        #         super(GaussPMask, self).__init__()
+        #         self.num_masks = len(areas)
+        #         self.H = H
+        #         self.W = W
+        #
+        #         h = torch.linspace(0, 1, self.H).to(device)
+        #         w = torch.linspace(0, 1, self.W).to(device)
+        #         self.h, self.w = torch.meshgrid(h, w)
+        #
+        #         self.mh = (torch.tensor([0.5] * self.num_masks))
+        #         self.mw = (torch.tensor([0.5] * self.num_masks))
+        #
+        #         self.sh = torch.nn.Parameter(torch.tensor([2.0] * self.num_masks))
+        #         self.sw = torch.nn.Parameter(torch.tensor([2.0] * self.num_masks))  # !!!!!
+        #
+        #     def _gaussian_2d(self, i):
+        #         A = 1 / (2 * math.pi * self.sh[i] * self.sw[i])
+        #         B = (self.h - self.mh[i]) ** 2 / (2 * self.sh[i] ** 2)
+        #         C = (self.w - self.mw[i]) ** 2 / (2 * self.sw[i] ** 2)
+        #         return A * torch.exp(-(B + C))
+        #
+        #     def forward(self):
+        #         pmask = torch.zeros(len(areas), self.H, self.W).to(device)
+        #         for i in range(self.num_masks):
+        #             z = self._gaussian_2d(i)
+        #             # print(z.max())
+        #             pmask[i] = z / z.max()
+        #         return pmask.unsqueeze(1)
+        #
+        # gauss_pmask_generator = GaussPMask(h, w, areas)
+        # gauss_pmask_generator.to(device)
+        # pmask = gauss_pmask_generator()
+        #
+        # for p in gauss_pmask_generator.named_parameters():
+        #     print(p)
+        #
+        # # Initialize optimizer.
+        # learning_rate = 0.005
+        # # optimizer = optim.SGD(gauss_pmask_generator.parameters(),
+        # #                       lr=learning_rate,
+        # #                       momentum=momentum,
+        # #                       dampening=momentum)
+        # optimizer = optim.SGD(gauss_pmask_generator.parameters(),
+        #                       lr=learning_rate)
+        # # optimizer = optim.Adam(gauss_pmask_generator.parameters(),
+        # #                       lr=learning_rate)
+        #
+        # grad_hist = []
+        # regul_area_weight = 10
+        # for t in range(max_iter):
+        #     print()
+        #     print(t)
+        #     pmask = gauss_pmask_generator()
+        #
+        #     # pmask.data = pmask.data.clamp(0, 1)
+        #
+        #     print('pmask stats:', pmask.min().data, pmask.max().data, pmask.mean().data)
+        #
+        #     # Generate the mask.
+        #     mask_, mask = mask_generator.generate(pmask)
+        #
+        #     # Area regularization.
+        #     # mask_sorted = mask.reshape(len(areas), -1).sort(dim=1)[0]
+        #     # regul_area = - ((mask_sorted - reference) ** 2).mean(dim=1) * regul_weight
+        #
+        #     covariance_det = gauss_pmask_generator.sh * gauss_pmask_generator.sw
+        #     reference_covariance_det = 0.005
+        #     regul_area = - ((covariance_det - reference_covariance_det) ** 2) * regul_area_weight
+        #     print(regul_area_weight)
+        #     regul_area_weight *= 1.1
+        #
+        #     energy = (regul_area)
+        #
+        #     # Gradient step.
+        #     optimizer.zero_grad()
+        #     (- energy).backward()
+        #     optimizer.step()
+        #
+        #     for name, p in gauss_pmask_generator.named_parameters():
+        #         if name == 'mh':
+        #             p.data = p.data.clamp(0, 1)
+        #         if name == 'mw':
+        #             p.data = p.data.clamp(0, 1)
+        #         if name == 'sh':
+        #             p.data = p.data.clamp(0.025, 0.1 * h)
+        #         if name == 'sw':
+        #             p.data = p.data.clamp(0.025, 0.1 * w)
+        #         # if name == 'gauss_scale':
+        #         #     p.data = p.data.clamp(0., 3000.)
+        #
+        #     for p in gauss_pmask_generator.named_parameters():
+        #         print(p)
+        #     print('sh * sw', gauss_pmask_generator.sh * gauss_pmask_generator.sw)
+        #     print('sh.grad, sw.grad', gauss_pmask_generator.sh.grad, gauss_pmask_generator.sw.grad)
+        #     grad_hist.append((gauss_pmask_generator.sh.grad.cpu(), gauss_pmask_generator.sw.grad.cpu()))
+        #
+        # for i, g in enumerate(grad_hist):
+        #     print(i, g)
+        #
+        # return

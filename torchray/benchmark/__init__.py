@@ -44,8 +44,13 @@ def get_example_data(arch='vgg16', shape=224):
     from PIL import Image
 
     url = 'https://upload.wikimedia.org/wikipedia/commons/thumb/7/7f/Arthur_Heyer_-_Dog_and_Cats.jpg/592px-Arthur_Heyer_-_Dog_and_Cats.jpg'
-    response = requests.get(url)
-    img = Image.open(BytesIO(response.content))
+    #response = requests.get(url)
+    #img = Image.open(BytesIO(response.content))
+
+    import urllib.request
+    urllib.request.urlretrieve(url, 'img_test.png')
+    img = Image.open("img_test.png")
+    
 
     # Pre-process the image and convert into a tensor
     transform = torchvision.transforms.Compose([
@@ -117,6 +122,7 @@ def plot_example(input,
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
         ext = os.path.splitext(save_path)[1].strip('.')
+        print('save_path', save_path)
         plt.savefig(save_path, format=ext, bbox_inches='tight')
 
     # Show plot if desired.

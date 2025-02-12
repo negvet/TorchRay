@@ -1,3 +1,5 @@
+import time
+
 from torchray.attribution.extremal_perturbation import extremal_perturbation, contrastive_reward
 from torchray.benchmark import get_example_data, plot_example
 from torchray.utils import get_device
@@ -11,12 +13,14 @@ model.to(device)
 x = x.to(device)
 
 # Extremal perturbation backprop.
+start = time.time()
 masks_1, _ = extremal_perturbation(
     model, x, category_id_1,
     reward_func=contrastive_reward,
     debug=True,
     areas=[0.12],
 )
+print('Extremal perturbation took', time.time() - start)
 
 masks_2, _ = extremal_perturbation(
     model, x, category_id_2,

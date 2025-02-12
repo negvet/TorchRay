@@ -320,10 +320,9 @@ class VOCDetection(torchvision.datasets.VOCDetection):
             image_set='train',
             download=False,
             transform=None,
-            target_transform=None,
-            transforms=None):
+            target_transform=None):
         super(torchvision.datasets.voc.VOCDetection, self).__init__(
-            root, transforms, transform, target_transform)
+            root, year, image_set, download, transform, target_transform)
 
         self.year = year
         self.url = torchvision.datasets.voc.DATASET_YEAR_DICT[year]['url']
@@ -352,7 +351,7 @@ class VOCDetection(torchvision.datasets.VOCDetection):
             file_names = [x.strip() for x in f.readlines()]
 
         self.images = [os.path.join(image_dir, x + ".jpg") for x in file_names]
-        self.annotations = [os.path.join(
+        self.targets = [os.path.join(
             annotation_dir, x + ".xml") for x in file_names]
         assert (len(self.images) == len(self.annotations))
 

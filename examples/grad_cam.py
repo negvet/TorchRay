@@ -8,4 +8,4 @@ model, x, category_id, _ = get_example_data()
 saliency = grad_cam(model, x, category_id, saliency_layer='features.29')
 
 # Plots.
-plot_example(x, saliency, 'grad-cam backprop', category_id)
+plot_example(x, saliency, 'grad-cam backprop', category_id, save_path='/home/etsykuno/TorchRay/grad_cam_output.png')
